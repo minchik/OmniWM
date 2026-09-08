@@ -542,7 +542,7 @@ final class GapSettingsTests: XCTestCase {
         XCTAssertEqual(settings.resolvedGapSettings(for: monitor).innerGap, 0)
         XCTAssertEqual(settings.resolvedDwindleSettings(for: monitor).innerGap, 0)
         XCTAssertEqual(controller.innerGap(for: monitor, scale: 2), 5.5)
-        XCTAssertEqual(controller.resolvedDwindleSettings(for: monitor).innerGap, 5.5)
+        XCTAssertEqual(controller.resolvedDwindleSettings(for: monitor, scale: 2).innerGap, 5.5)
         XCTAssertEqual(frames.workingFrame, CGRect(x: 5.5, y: 5.5, width: 1429, height: 889))
         XCTAssertEqual(frames.borderSafeFillFrame, frames.workingFrame)
         XCTAssertEqual(frames.fullscreenLayoutFrame, monitor.visibleFrame)

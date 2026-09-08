@@ -1,0 +1,140 @@
+name: Swift tests and app build
+
+on:
+  push:
+    branches:
+      - ci/xcode-27-tests
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swift-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    if: github.repository == 'minchik/OmniWM'
+    runs-on: xcode-27
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
+      GHOSTTY_VERSION: 0.6.8
+      GHOSTTY_ZIP_SHA256: db543774b853ac0b051daa784ce8907a3101856ba3e5e65757da492b32d61e57
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check build environment
+        run: |
+          test "$(uname -m)" = arm64
+          sw_vers
+          xcodebuild -version
+          xcrun swift --version
+          xcrun --sdk macosx --show-sdk-version
+
+      - name: Download and verify GhosttyKit
+        run: |
+          archive="$RUNNER_TEMP/GhosttyKit.xcframework.zip"
+          curl --fail --location --retry 3 \
+            "https://github.com/BarutSRB/OmniWM/releases/download/v${GHOSTTY_VERSION}/GhosttyKit.xcframework-v${GHOSTTY_VERSION}.zip" \
+            --output "$archive"
+          printf '%s  %s\n' "$GHOSTTY_ZIP_SHA256" "$archive" | shasum -a 256 --check
+          mkdir -p Frameworks
+          unzip -q "$archive" -d Frameworks
+          library_dir="$(./Scripts/ghostty-preflight.sh print-library-dir)"
+          echo "LIBRARY_PATH=$library_dir" >> "$GITHUB_ENV"
+
+      - name: Run default test suite
+        run: |
+          xcrun swift test --arch arm64 --jobs 3 \
+            --xunit-output "$RUNNER_TEMP/test-results.xml" \
+            2>&1 | tee "$RUNNER_TEMP/swift-tests.log"
+
+      - name: Verify regressions against upstream code
+        run: |
+          navigation=Sources/OmniWM/Core/Controller/WorkspaceNavigationHandler.swift
+          router=Sources/OmniWM/IPC/IPCCommandRouter.swift
+          gaps=Tests/OmniWMTests/GapSettingsTests.swift
+          baseline=99c63492aeb3ba4b515ed65ce44e305e63ac4a1d
+          trap 'git restore -- "$navigation" "$router" "$gaps"' EXIT
+          git show "$baseline:$navigation" > "$navigation"
+          git show "$baseline:$router" > "$router"
+          git show "$baseline:$gaps" > "$gaps"
+
+          set +e
+          xcrun swift test --arch arm64 --jobs 3 \
+            --filter 'WorkspaceSlotNavigationTests|GapSettingsTests/testBorderClearanceFloorsRuntimeGapsWithoutMutatingStoredValues' \
+            2>&1 | tee "$RUNNER_TEMP/baseline-tests.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" -eq 1
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          log = (Path(os.environ["RUNNER_TEMP"]) / "baseline-tests.log").read_text()
+          failures = set(re.findall(r"Test Case '-\[([^\]]+)\]' failed", log))
+          expected = {
+              "OmniWMTests.WorkspaceSlotNavigationTests testWorkspaceShortcutTransfersFocusAfterMouseWarp",
+              "OmniWMTests.WorkspaceSlotNavigationTests testWorkspaceSlotShortcutTransfersFocusAfterMouseWarp",
+              "OmniWMTests.WorkspaceSlotNavigationTests testWorkspaceIPCCommandTransfersFocusAfterMouseWarp",
+              "OmniWMTests.WorkspaceSlotNavigationTests testWorkspaceSlotIPCCommandTransfersFocusAfterMouseWarp",
+              "OmniWMTests.WorkspaceSlotNavigationTests testWorkspaceAnywhereIPCCommandTransfersFocusAfterMouseWarp",
+              "OmniWMTests.GapSettingsTests testBorderClearanceFloorsRuntimeGapsWithoutMutatingStoredValues",
+          }
+          assert failures == expected, f"Unexpected baseline failures: {failures}"
+          assert re.search(r"Executed 14 tests, with \d+ failures", log), "Baseline suite did not finish"
+          print("Confirmed: original focus code fails the regression; gap failure also exists upstream.")
+          PY
+
+      - name: Package development app
+        run: |
+          git diff --exit-code HEAD -- Sources Tests
+          export PATH="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin:$PATH"
+          ./Scripts/package-app.sh release dev 2>&1 | tee "$RUNNER_TEMP/package-app.log"
+          codesign --verify --deep --strict --verbose=2 dist/OmniWM.app
+          test "$(plutil -extract OMNIWMGitHash raw dist/OmniWM.app/Contents/Info.plist)" = "$(git rev-parse --short HEAD)"
+          ditto -c -k --sequesterRsrc --keepParent dist/OmniWM.app dist/OmniWM-workspace-focus-arm64.zip
+          shasum -a 256 dist/OmniWM-workspace-focus-arm64.zip > dist/SHA256SUMS
+          {
+            echo '## Development app'
+            echo "Commit: $GITHUB_SHA"
+            echo
+            echo 'Download the OmniWM-workspace-focus-arm64 artifact and extract its app ZIP.'
+            echo 'Requires Apple Silicon and macOS 26 or newer. No Xcode installation is needed.'
+            echo 'Quit the installed OmniWM and keep a backup before replacing it with this build.'
+            echo 'This app is development-signed, not notarized. If macOS blocks it, use System Settings > Privacy & Security > Open Anyway.'
+            echo 'You may need to remove and re-add OmniWM in Accessibility permissions.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload development app
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: OmniWM-workspace-focus-arm64
+          path: |
+            dist/OmniWM-workspace-focus-arm64.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: swift-test-results
+          path: |
+            ${{ runner.temp }}/swift-tests.log
+            ${{ runner.temp }}/test-results.xml
+            ${{ runner.temp }}/baseline-tests.log
+            ${{ runner.temp }}/package-app.log
+          if-no-files-found: ignore
+          retention-days: 7
